@@ -196,16 +196,89 @@ echo ">>> Step 5: Setting up configuration..."
 # Create .codex directory in user's home
 mkdir -p ~/.codex
 
+# --- Generate Azure-compatible model catalog ---
+# Azure OpenAI deployments (e.g. gpt-5-codex-2025-09-15) do not support
+# reasoning.context = "all_turns" which Codex sends when use_responses_lite
+# is true.  The built-in catalog lacks a "gpt-5-codex" slug, so Codex falls
+# back to generic metadata that enables use_responses_lite by default.
+# Providing an explicit catalog entry with use_responses_lite: false prevents
+# the BadRequest error.  See https://github.com/openai/codex/issues/31882
+echo "[INFO] Generating Azure-compatible model catalog..."
+codex_bin="$(pwd)/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+catalog_file="$HOME/.codex/model_catalog.json"
+
+if [[ -f "$codex_bin" ]] && command_exists python3; then
+    python3 - "$codex_bin" "$catalog_file" <<'PYEOF'
+import copy, json, sys
+binary_path, output_path = sys.argv[1], sys.argv[2]
+with open(binary_path, "rb") as f:
+    data = f.read()
+first_slug = data.find(b'"slug":')
+if first_slug < 0:
+    sys.exit("cannot locate model catalog in binary")
+obj_start = data.rfind(b'{"models"', max(0, first_slug - 200), first_slug)
+if obj_start < 0:
+    obj_start = data.rfind(b'{ "models"', max(0, first_slug - 200), first_slug)
+if obj_start < 0:
+    models_key = data.rfind(b'"models"', max(0, first_slug - 200), first_slug)
+    if models_key >= 0:
+        obj_start = data.rfind(b'{', max(0, models_key - 50), models_key)
+if obj_start < 0:
+    sys.exit("cannot find catalog object start")
+depth, i = 0, obj_start
+while i < len(data):
+    if data[i:i+1] == b'{': depth += 1
+    elif data[i:i+1] == b'}':
+        depth -= 1
+        if depth == 0: break
+    i += 1
+catalog = json.loads(data[obj_start:i+1], strict=False)
+models = catalog.get("models", [])
+if not models:
+    sys.exit("embedded catalog has no models")
+donor = next((m for m in models if m.get("slug") == "gpt-5.5"), None)
+if donor is None:
+    donor = next((m for m in models if not m.get("use_responses_lite", True)), models[0])
+codex_entry = copy.deepcopy(donor)
+codex_entry.update({"slug": "gpt-5-codex", "display_name": "GPT-5-Codex (Azure)",
+    "description": "GPT-5-Codex via AMD LLM Gateway (Azure OpenAI).",
+    "use_responses_lite": False, "multi_agent_version": None,
+    "visibility": "list", "upgrade": None, "priority": 1,
+    "max_context_window": 1000000})
+o3_entry = copy.deepcopy(donor)
+o3_entry.update({"slug": "o3", "display_name": "o3 (Azure)",
+    "description": "o3 reasoning model via AMD LLM Gateway.",
+    "use_responses_lite": False, "multi_agent_version": None,
+    "visibility": "list", "upgrade": None, "priority": 10,
+    "context_window": 200000, "max_context_window": 200000,
+    "support_verbosity": False})
+for m in models:
+    m["use_responses_lite"] = False
+    m["multi_agent_version"] = None
+catalog["models"] = [codex_entry, o3_entry] + models
+with open(output_path, "w") as f:
+    json.dump(catalog, f, indent=2)
+    f.write("\n")
+print(f"wrote {output_path} with {len(catalog['models'])} models")
+PYEOF
+    if [[ $? -eq 0 ]]; then
+        echo "[OK] Model catalog created at: $catalog_file"
+    else
+        echo "[WARN] Failed to generate model catalog; codex may fail with Azure models"
+    fi
+else
+    echo "[WARN] Codex binary or python3 not found; skipping model catalog generation"
+fi
+
 # Create config.toml for Codex CLI (Rust version supports TOML with env vars)
 config_file="$HOME/.codex/config.toml"
 cat > "$config_file" << 'EOF'
 # Codex CLI Configuration for AMD LLM Gateway
-# Multi-profile configuration with GPT-5 Codex (high reasoning) as default
 
-# Default model switched to GPT-5 Codex (high-reasoning preset)
 model = "gpt-5-codex"
 model_provider = "gpt5_gateway"
-projects = { "/proj/cad_ml2/zoliu/gateway" = { trust_level = "trusted" } , "/proj/cad_ml2/zoliu/fresh_codex" = { trust_level = "trusted" }, "/proj/cad_ml2/zoliu/AMD_gateway_union" = { trust_level = "trusted" } }
+model_reasoning_effort = "medium"
+model_catalog_json = "~/.codex/model_catalog.json"
 
 [model_providers.amd_gateway]
 name = "AMD LLM Gateway"
@@ -226,12 +299,10 @@ wire_api = "responses"
 query_params = { api-version = "2025-04-01-preview" }
 env_http_headers = { "Ocp-Apim-Subscription-Key" = "AMD_LLM_API_KEY" }
 
-# Profile for o3 (default)
 [profiles.o3]
 model = "o3"
 model_provider = "amd_gateway"
 
-# Profile for Babel local gateway (non-default)
 [profiles.claude]
 model = "Claude-Sonnet-4"
 model_provider = "babel_gateway"
@@ -240,16 +311,9 @@ model_provider = "babel_gateway"
 model = "gemini-2.5-pro"
 model_provider = "babel_gateway"
 
-# Profile for GPT-5 (non-default)
 [profiles.gpt5]
-# GPT-5 Codex high reasoning profile
 model = "gpt-5-codex"
 model_provider = "gpt5_gateway"
-# GPT-5 specific notes:
-# - No temperature parameter support (uses default 1.0)
-# - Full tool/function calling support
-# - Use max_tokens instead of max_completion_tokens
-# - Supports system messages
 EOF
 
 echo "[OK] Configuration created at: $config_file"
