@@ -54,10 +54,13 @@ Both modes install Codex CLI in the current directory and create shell aliases f
 
 ### Model Profiles
 
-The setup creates multiple model profiles in `~/.codex/config.toml`:
+The default model is **GPT-6.1-Sol**. Each profile is a file `~/.codex/<name>.config.toml`
+that overlays `~/.codex/config.toml` (Codex 0.134+ no longer reads `[profiles.<name>]`
+tables, and refuses `--profile` while they exist):
 
-- **o3** (default): Uses AMD Gateway with responses API
-- **gpt5**: GPT-5 via AMD Gateway with responses API
+- **gpt61sol**: GPT-6.1-Sol via AMD Gateway (same as the default)
+- **gpt5**: GPT-5-Codex via AMD Gateway
+- **o3**: o3 via AMD Gateway (being retired on the gateway, announced for 2026-10-15)
 - **claude**: Claude Sonnet 4 via Babel local gateway
 - **gemini**: Gemini 2.5 Pro via Babel local gateway
 
@@ -67,6 +70,9 @@ codex --profile gpt5
 codex --profile claude
 codex --profile gemini
 ```
+
+Switch models with `--profile`, not with `/model` inside the TUI: see
+[Model name and gateway URL](#model-name-and-gateway-url).
 
 ### Environment Variables
 
@@ -90,7 +96,7 @@ setenv AMD_LLM_API_KEY 'your-api-key-here'
 ## Usage Examples
 
 ```bash
-# Start interactive Codex session with default (o3) model
+# Start interactive Codex session with the default (GPT-6.1-Sol) model
 codex
 
 # Use a specific profile
@@ -121,7 +127,8 @@ codex/
 3. **Node.js Validation**: Checks for Node.js 18+ and npm
 4. **npm Configuration**: Sets up local npm directories
 5. **Package Installation**: Installs `@openai/codex` via npm
-6. **Configuration**: Creates `~/.codex/config.toml` with multi-profile setup
+6. **Configuration**: Creates `~/.codex/model_catalog.json`, `~/.codex/config.toml` and one
+   `~/.codex/<name>.config.toml` per profile
 7. **Shell Integration**: Adds aliases and API key placeholders to shell configs
 
 ## Troubleshooting
@@ -141,11 +148,37 @@ To use Claude or Gemini profiles, ensure Babel gateway is running on `localhost:
 ### Module System
 The script attempts to use the Pandora module system if available. If not found, it falls back to checking system PATH for Node.js.
 
+### Model name and gateway URL
+The gateway routes by URL path: `https://llm-api.amd.com/openai/<deployment>` always
+serves `<deployment>`, whatever model name Codex sends. Codex, however, chooses which
+tools to offer from the model name (via `~/.codex/model_catalog.json`). So `model` must
+equal the last path segment of its provider's `base_url`. Symptoms when it does not:
+
+- Codex says every command returns nothing, or retries `exec {"cmd":"ls"}` with
+  `Script error: SyntaxError` — a GPT-6.x/5.6 name (JavaScript code-mode tools) sent to
+  the `gpt-5-codex` URL. Typically after `/model` in the TUI, which changes the name only.
+- `Tool 'tool_search' is not supported with gpt-5-codex-2025-09-15` — the catalog entry
+  for gpt-5-codex enables `tool_search`; the setup script turns it off.
+- `Invalid value: 'custom'` on o3 — freeform apply_patch; the setup script turns it off.
+
+To add another model, add a provider whose `base_url` ends in its deployment name plus a
+`~/.codex/<name>.config.toml` with that `model` and `model_provider`.
+
+### Changes to ~/.codex not taking effect
+The TUI talks to a background app-server daemon that reads `config.toml` and the model
+catalog once, when it starts. After editing them, run
+`codex app-server daemon restart`, then quit and restart each `codex` TUI.
+(`codex exec` does not use the daemon, so it sees edits immediately.)
+
 ## Model-Specific Notes
 
-### o3 (Default)
+### GPT-6.1-Sol (Default)
+- Uses AMD Gateway responses API with Codex's code-mode tools
+
+### o3
 - Uses AMD Gateway responses API
 - Full tool/function calling support
+- Being retired on the gateway (announced for 2026-10-15)
 
 ### GPT-5
 - No temperature parameter support (uses default 1.0)
@@ -154,8 +187,8 @@ The script attempts to use the Pandora module system if available. If not found,
 
 ### Claude Sonnet 4
 - Requires Babel local gateway
-- Uses chat API format
+- Uses the responses API (Codex no longer supports `wire_api = "chat"`)
 
 ### Gemini 2.5 Pro
 - Requires Babel local gateway
-- Uses chat API format
+- Uses the responses API (Codex no longer supports `wire_api = "chat"`)

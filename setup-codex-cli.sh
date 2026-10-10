@@ -203,6 +203,11 @@ mkdir -p ~/.codex
 # back to generic metadata that enables use_responses_lite by default.
 # Providing an explicit catalog entry with use_responses_lite: false prevents
 # the BadRequest error.  See https://github.com/openai/codex/issues/31882
+#
+# The clones also get supports_search_tool=false (the gpt-5-codex deployment
+# rejects it: "Tool 'tool_search' is not supported with gpt-5-codex-2025-09-15")
+# and o3 gets no freeform apply_patch (its deployment rejects "custom" tools).
+# The gpt-6.x deployments accept both, so built-in entries stay as they are.
 echo "[INFO] Generating Azure-compatible model catalog..."
 codex_bin="$(pwd)/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
 catalog_file="$HOME/.codex/model_catalog.json"
@@ -243,12 +248,14 @@ codex_entry = copy.deepcopy(donor)
 codex_entry.update({"slug": "gpt-5-codex", "display_name": "GPT-5-Codex (Azure)",
     "description": "GPT-5-Codex via AMD LLM Gateway (Azure OpenAI).",
     "use_responses_lite": False, "multi_agent_version": None,
+    "supports_search_tool": False, "tool_mode": None,
     "visibility": "list", "upgrade": None, "priority": 1,
     "max_context_window": 1000000})
 o3_entry = copy.deepcopy(donor)
 o3_entry.update({"slug": "o3", "display_name": "o3 (Azure)",
     "description": "o3 reasoning model via AMD LLM Gateway.",
     "use_responses_lite": False, "multi_agent_version": None,
+    "supports_search_tool": False, "tool_mode": None, "apply_patch_tool_type": None,
     "visibility": "list", "upgrade": None, "priority": 10,
     "context_window": 200000, "max_context_window": 200000,
     "support_verbosity": False})
@@ -274,11 +281,26 @@ fi
 config_file="$HOME/.codex/config.toml"
 cat > "$config_file" << 'EOF'
 # Codex CLI Configuration for AMD LLM Gateway
+#
+# The gateway routes by URL path: https://llm-api.amd.com/openai/<deployment>
+# always serves <deployment>. Each model needs its own provider, and `model`
+# must equal the last path segment of its provider's base_url; otherwise codex
+# offers tools meant for another model (e.g. picking gpt-6.1-sol with /model on
+# the gpt-5-codex provider breaks every shell command). Switch with --profile.
 
-model = "gpt-5-codex"
-model_provider = "gpt5_gateway"
+model = "gpt-6.1-sol"
+model_provider = "gpt61sol_gateway"
 model_reasoning_effort = "medium"
 model_catalog_json = "~/.codex/model_catalog.json"
+
+[model_providers.gpt61sol_gateway]
+name = "AMD LLM Gateway - GPT-6.1-Sol"
+base_url = "https://llm-api.amd.com/openai/gpt-6.1-sol"
+wire_api = "responses"
+query_params = { api-version = "2025-04-01-preview" }
+env_http_headers = { "Ocp-Apim-Subscription-Key" = "AMD_LLM_API_KEY" }
+
+# o3 is being retired on the gateway (announced for 2026-10-15).
 
 [model_providers.amd_gateway]
 name = "AMD LLM Gateway"
@@ -290,7 +312,8 @@ env_http_headers = { "Ocp-Apim-Subscription-Key" = "AMD_LLM_API_KEY" }
 [model_providers.babel_gateway]
 name = "Babel Local Gateway"
 base_url = "http://localhost:5000/v1"
-wire_api = "chat"
+# Codex no longer accepts wire_api = "chat" (the whole config fails to load).
+wire_api = "responses"
 
 [model_providers.gpt5_gateway]
 name = "AMD LLM Gateway - GPT-5"
@@ -299,24 +322,26 @@ wire_api = "responses"
 query_params = { api-version = "2025-04-01-preview" }
 env_http_headers = { "Ocp-Apim-Subscription-Key" = "AMD_LLM_API_KEY" }
 
-[profiles.o3]
-model = "o3"
-model_provider = "amd_gateway"
+# Profiles live in ~/.codex/<name>.config.toml (Codex 0.134+); a [profiles.<name>]
+# table here makes `codex --profile <name>` refuse to start.
+EOF
 
-[profiles.claude]
-model = "Claude-Sonnet-4"
-model_provider = "babel_gateway"
-
-[profiles.gemini]
-model = "gemini-2.5-pro"
-model_provider = "babel_gateway"
-
-[profiles.gpt5]
-model = "gpt-5-codex"
-model_provider = "gpt5_gateway"
+while read -r name model provider; do
+    cat > "$HOME/.codex/${name}.config.toml" << EOF
+# codex --profile ${name}  (overlays ~/.codex/config.toml; written by setup-codex-cli.sh)
+model = "${model}"
+model_provider = "${provider}"
+EOF
+done << 'EOF'
+gpt61sol gpt-6.1-sol gpt61sol_gateway
+gpt5 gpt-5-codex gpt5_gateway
+o3 o3 amd_gateway
+claude Claude-Sonnet-4 babel_gateway
+gemini gemini-2.5-pro babel_gateway
 EOF
 
 echo "[OK] Configuration created at: $config_file"
+echo "[OK] Profiles: ~/.codex/{gpt61sol,gpt5,o3,claude,gemini}.config.toml"
 echo ""
 
 # Step 6: Set up shell aliases
@@ -467,11 +492,14 @@ echo "  * Configuration: $config_file"
 echo "  * API Key variable: AMD_LLM_API_KEY (needs to be set)"
 echo ""
 echo "Available model profiles:"
-echo "  * codex --profile gpt5    (default, GPT-5 Codex high reasoning, AMD Gateway, responses API)"
-echo "  * codex --profile o3      (o3, AMD Gateway, responses API)"
-echo "  * codex --profile claude  (Claude-Sonnet-4, Babel local gateway, chat API)"
-echo "  * codex --profile gemini  (gemini-2.5-pro, Babel local gateway, chat API)"
-echo "  * codex                   (uses GPT-5 Codex by default)"
+echo "  * codex                     (default: GPT-6.1-Sol, AMD Gateway, responses API)"
+echo "  * codex --profile gpt61sol  (same as the default)"
+echo "  * codex --profile gpt5      (GPT-5 Codex, AMD Gateway, responses API)"
+echo "  * codex --profile o3        (o3, AMD Gateway, responses API; retiring 2026-10-15)"
+echo "  * codex --profile claude    (Claude-Sonnet-4, Babel local gateway, responses API)"
+echo "  * codex --profile gemini    (gemini-2.5-pro, Babel local gateway, responses API)"
+echo "  Switch models with --profile, not /model: each gateway model has its own URL."
+echo "  After editing ~/.codex by hand: codex app-server daemon restart, then restart codex."
 echo ""
 echo "Next steps:"
 echo "  1. Set your AMD_LLM_API_KEY environment variable"
